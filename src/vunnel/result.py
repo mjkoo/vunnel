@@ -7,6 +7,7 @@ import os
 import shutil
 import time
 from dataclasses import asdict, dataclass
+from datetime import UTC, datetime
 from typing import TYPE_CHECKING, Any
 
 import orjson
@@ -161,14 +162,37 @@ class SQLiteStore(Store):
             metadata,
             db.Column("id", db.String(), primary_key=True, index=True),
             db.Column("record", db.LargeBinary()),
+            db.Column("created_at", db.DateTime(), nullable=False),
+            db.Column("updated_at", db.DateTime(), nullable=False),
         )
-        if self.engine:
+
+        inspector = db.inspect(self.engine)
+        if inspector.has_table(self.table_name):
+            # Table exists, check if we need to add timestamp columns
+            existing_columns = {col["name"] for col in inspector.get_columns(self.table_name)}
+
+            if "created_at" not in existing_columns or "updated_at" not in existing_columns:
+                self.logger.info(f"Migrating {self.table_name} table to include timestamp columns")
+                current_time = datetime.now(UTC).replace(tzinfo=None)
+
+                if self.engine is not None:
+                    with self.engine.begin() as conn:
+                        if "created_at" not in existing_columns:
+                            conn.execute(db.text("ALTER TABLE results ADD COLUMN created_at DATETIME"))
+                            conn.execute(db.text("UPDATE results SET created_at = :time"), {"time": current_time})
+
+                        if "updated_at" not in existing_columns:
+                            conn.execute(db.text("ALTER TABLE results ADD COLUMN updated_at DATETIME"))
+                            conn.execute(db.text("UPDATE results SET updated_at = :time"), {"time": current_time})
+        else:
             metadata.create_all(self.engine)
+
         return table
 
     def store(self, identifier: str, record: Envelope) -> None:
         record_str = orjson.dumps(asdict(record))
         conn, table = self.connection()
+        current_time = datetime.now(UTC).replace(tzinfo=None)
 
         with conn.begin():
             # upsert the record conditionally based on the skip_duplicates configuration
@@ -178,10 +202,22 @@ class SQLiteStore(Store):
                     self.logger.warning(f"{identifier!r} entry already written (skipping)")
                     return
                 self.logger.trace(f"overwriting existing entry: {identifier!r}")  # type: ignore[attr-defined]
-                statement = db.update(table).where(table.c.id == identifier).values(record=record_str)
+                statement = (
+                    db.update(table)
+                    .where(table.c.id == identifier)
+                    .values(
+                        record=record_str,
+                        updated_at=current_time,
+                    )
+                )
             else:
                 self.logger.trace(f"writing record to {identifier!r} key")  # type: ignore[attr-defined]
-                statement = db.insert(table).values(id=identifier, record=record_str)  # type: ignore[assignment]
+                statement = db.insert(table).values(
+                    id=identifier,
+                    record=record_str,
+                    created_at=current_time,
+                    updated_at=current_time,
+                )
 
             conn.execute(statement)
 
