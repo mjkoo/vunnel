@@ -1,0 +1,112 @@
+name: "Sync with Upstream"
+
+on:
+  schedule:
+    # Run at 2 AM UTC every day
+    - cron: '0 2 * * *'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  sync-and-rebase:
+    name: "Sync Main and Rebase Feature Branch"
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 #v4.2.2
+        with:
+          fetch-depth: 0
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Configure git
+        run: |
+          git config user.name "GitHub Actions"
+          git config user.email "actions@github.com"
+
+      - name: Add upstream remote
+        run: |
+          git remote add upstream https://github.com/anchore/vunnel.git || true
+          git remote -v
+
+      - name: Fetch all branches and tags
+        run: |
+          git fetch origin
+          git fetch upstream
+
+      - name: Sync main branch with upstream
+        run: |
+          git checkout --track origin/main
+          git merge upstream/main --ff-only
+          git push origin main
+
+      - name: Rebase sqlite-timestamps branch
+        id: rebase
+        run: |
+          # Check if the branch exists
+          if git show-ref --verify --quiet refs/remotes/origin/sqlite-timestamps; then
+            if ! git rev-parse --verify sqlite-timestamps >/dev/null 2>&1; then
+              git checkout -b sqlite-timestamps
+            else
+              git checkout sqlite-timestamps
+            fi
+           
+            # Attempt to rebase on main
+            if git rebase main; then
+              echo "rebase_success=true" >> $GITHUB_OUTPUT
+              echo "Rebase completed successfully"
+            else
+              echo "rebase_success=false" >> $GITHUB_OUTPUT
+              echo "Rebase failed with conflicts"
+              git rebase --abort
+              exit 1
+            fi
+          else
+            echo "Branch sqlite-timestamps does not exist"
+            echo "rebase_success=skip" >> $GITHUB_OUTPUT
+          fi
+
+      # Run tests on the rebased branch before pushing
+      - name: Bootstrap environment
+        if: steps.rebase.outputs.rebase_success == 'true'
+        uses: ./.github/actions/bootstrap
+
+      - name: Run static analysis
+        if: steps.rebase.outputs.rebase_success == 'true'
+        run: make static-analysis
+
+      - name: Run unit tests (Python 3.11)
+        if: steps.rebase.outputs.rebase_success == 'true'
+        run: uv run tox -e py311
+
+      - name: Push rebased branch
+        if: steps.rebase.outputs.rebase_success == 'true'
+        run: |
+          echo "Force pushing rebased branch"
+          git push origin sqlite-timestamps --force-with-lease
+
+      - name: Summary
+        if: always()
+        run: |
+          echo "## Sync Summary" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "- Main branch synced with upstream: ✅" >> $GITHUB_STEP_SUMMARY
+          if [[ "${{ steps.rebase.outputs.rebase_success }}" == "true" ]]; then
+            echo "- Feature branch rebase: ✅ Successfully rebased" >> $GITHUB_STEP_SUMMARY
+            
+            # Check if tests were run and their status
+            if [[ "${{ job.status }}" == "success" ]]; then
+              echo "- Tests: ✅ All tests passed" >> $GITHUB_STEP_SUMMARY
+              echo "- Branch push: ✅ Successfully pushed" >> $GITHUB_STEP_SUMMARY
+            else
+              echo "- Tests: ❌ Tests failed or workflow was cancelled" >> $GITHUB_STEP_SUMMARY
+              echo "- Branch push: ⏭️ Skipped due to test failure" >> $GITHUB_STEP_SUMMARY
+            fi
+          elif [[ "${{ steps.rebase.outputs.rebase_success }}" == "false" ]]; then
+            echo "- Feature branch rebase: ❌ Failed with conflicts" >> $GITHUB_STEP_SUMMARY
+            echo "- Tests: ⏭️ Skipped due to rebase failure" >> $GITHUB_STEP_SUMMARY
+            echo "- Branch push: ⏭️ Skipped due to rebase failure" >> $GITHUB_STEP_SUMMARY
+          else
+            echo "- Feature branch rebase: ⏭️ Skipped (branch does not exist)" >> $GITHUB_STEP_SUMMARY
+          fi
